@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HSE Training Dashboard</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Inter', -apple-system, system-ui, sans-serif; background: #080d14; color: #e4e4e7; min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const BATCH_META = {
+      142: { status: 'Active',    startDate: '8 Apr 2026',  endDate: '20 Apr 2026', driveLink: 'https://drive.google.com/drive/folders/1kNMHfrJsZ2iC-k2-EkOBav6BMXDb2t3-?usp=sharing' },
+      143: { status: 'Active',    startDate: '8 Apr 2026',  endDate: '20 Apr 2026', driveLink: 'https://drive.google.com/drive/folders/1oC5NFV4hLq-tjuaItaaSaaIDYBhWAt6R?usp=drive_link' },
+      144: { status: 'Active',    startDate: '8 Apr 2026',  endDate: '17 Apr 2026', driveLink: 'https://drive.google.com/drive/folders/1N_xrGCSZ55OOCVp-WUga8Sk93bG_iQHw?usp=sharing' },
+      139: { status: 'Completed', startDate: '—', endDate: '—', driveLink: '' },
+      140: { status: 'Completed', startDate: '—', endDate: '—', driveLink: '' },
+      141: { status: 'Completed', startDate: '—', endDate: '—', driveLink: '' },
+    };
+
+    function TrainingDashboard() {
+      const [batches, setBatches]             = useState([]);
+      const [studentData, setStudentData]     = useState({});
+      const [loading, setLoading]             = useState(true);
+      const [error, setError]                 = useState(null);
+      const [selectedBatch, setSelectedBatch] = useState(null);
+      const [searchTerm, setSearchTerm]       = useState('');
+      const [currentTime, setCurrentTime]     = useState(new Date());
+      const [activeTab, setActiveTab]         = useState('current');
+
+      useEffect(() => {
+        const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+        return () => clearInterval(timer);
+      }, []);
+
+      const RAW_SHEET_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSTNo_R-1F799Vvs11t0EG_kMkWqFOrbA9v4ShwysswLR_xvfWraTTv5LFvyCoguw/pub?output=csv';
+
+      useEffect(() => { loadData(); }, []);
+
+      const loadData = async () => {
+        try {
+          setLoading(true);
+          setError(null);
+          const response = await fetch(RAW_SHEET_URL);
+          if (!response.ok) throw new Error('Failed to fetch data from Google Sheets.');
+          const csvText = await response.text();
+          Papa.parse(csvText, {
+            header: true,
+            skipEmptyLines: true,
+            complete: (results) => processData(results.data),
+            error: () => { setError('Error parsing sheet data'); setLoading(false); }
+          });
+        } catch (err) {
+          setError(err.message);
+          setLoading(false);
+        }
+      };
+
+      const processData = (rows) => {
+        const studentsByBatch = {};
+        rows.forEach(row => {
+          const batchRaw = row['Batch'] || row['batch'];
+          if (!batchRaw) return;
+          const batchId = parseInt(batchRaw);
+          if (!batchId) return;
+          if (!studentsByBatch[batchId]) studentsByBatch[batchId] = [];
+          const studentId = String(row['Student ID'] || row['Student_ID'] || '').trim();
+          if (!studentId) return;
+          const assignments = parseInt(row['Assignments'] || 0) || 0;
+          const feedback    = parseInt(row['Feedbacks']   || row['Feedback'] || 0) || 0;
+          const interviews  = parseInt(row['Interviews']  || 0) || 0;
+          studentsByBatch[batchId].push({
+            id: studentId.padStart(3, '0'),
+            name: row['Student Name'] || row['Student_Name'] || 'Unknown',
+            assignments, feedback, interviews,
+            folder: row['Folder_Link'] || row['folder_link'] || '',
+            progress: Math.round((assignments/5 + feedback/5 + interviews/2) / 3 * 100)
+          });
+        });
+
+        const liveBatches = Object.keys(studentsByBatch).map(bid => {
+          const id = parseInt(bid);
+          const students = studentsByBatch[id];
+          const meta = BATCH_META[id] || { status:'Active', startDate:'—', endDate:'—', driveLink:'' };
+          return {
+            id, ...meta,
+            students: students.length,
+            assignmentsComplete: students.reduce((s,x) => s+x.assignments, 0),
+            feedbackComplete:    students.reduce((s,x) => s+x.feedback, 0),
+            interviewsComplete:  students.reduce((s,x) => s+x.interviews, 0),
+            overallProgress: Math.round(students.reduce((s,x) => s+x.progress, 0) / (students.length||1)),
+            hasStudentData: true
+          };
+        });
+
+        const completedPlaceholders = [139, 140, 141].map(id => ({
+          id, ...BATCH_META[id],
+          students: 0, assignmentsComplete:0, feedbackComplete:0, interviewsComplete:0,
+          overallProgress: 100, hasStudentData: false
+        }));
+
+        const allBatches = [...liveBatches, ...completedPlaceholders].sort((a,b) => a.id - b.id);
+        setStudentData(studentsByBatch);
+        setBatches(allBatches);
+        setLoading(false);
+      };
+
+      const activeBatches    = batches.filter(b => b.status === 'Active');
+      const completedBatches = batches.filter(b => b.status === 'Completed');
+      const displayedBatches = activeTab === 'active' ? activeBatches : activeTab === 'completed' ? completedBatches : activeBatches;
+      const totalStudents    = activeBatches.reduce((s,b) => s+b.students, 0);
+
+      const filteredStudents = selectedBatch
+        ? (studentData[selectedBatch.id] || []).filter(s =>
+            s.name.toLowerCase().includes(searchTerm.toLowerCase()) || s.id.includes(searchTerm))
+        : [];
+
+      if (loading) return (
+        <div style={{minHeight:'100vh',background:'#080d14',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',color:'#a1a1aa',fontFamily:'Inter'}}>
+          <div style={{width:'40px',height:'40px',border:'3px solid #27272a',borderTop:'3px solid #6366f1',borderRadius:'50%',animation:'spin 1s linear infinite',marginBottom:'20px'}}/>
+          <div>Loading dashboard data...</div>
+          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+        </div>
+      );
+
+      if (error) return (
+        <div style={{minHeight:'100vh',background:'#080d14',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',color:'#e4e4e7',padding:'40px'}}>
+          <div style={{fontSize:'2rem',marginBottom:'20px',opacity:0.6}}>⚠</div>
+          <div style={{fontSize:'1.2rem',marginBottom:'10px'}}>Error Loading Data</div>
+          <div style={{fontSize:'0.875rem',color:'#71717a',marginBottom:'30px'}}>{error}</div>
+          <button onClick={loadData} style={{padding:'10px 20px',fontSize:'0.875rem',background:'transparent',color:'#6366f1',border:'1px solid #6366f1',borderRadius:'6px',cursor:'pointer',fontFamily:'Inter',fontWeight:500}}>Try Again</button>
+        </div>
+      );
+
+      return (
+        <div style={{minHeight:'100vh',background:'#080d14',backgroundImage:'linear-gradient(to right,#18181b 1px,transparent 1px),linear-gradient(to bottom,#18181b 1px,transparent 1px)',backgroundSize:'60px 60px',fontFamily:'Inter'}}>
+          <style>{`
+            @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+            @keyframes breathe{0%,100%{opacity:1}50%{opacity:0.4}}
+            .card{background:rgba(24,24,27,0.4);border:1px solid #27272a;border-radius:8px;transition:all 0.2s ease;animation:fadeUp 0.4s ease-out;backdrop-filter:blur(10px)}
+            .card:hover{border-color:#3f3f46;box-shadow:0 0 0 1px #3f3f46}
+            .btn-ghost{padding:8px 16px;font-size:0.875rem;background:transparent;color:#a1a1aa;border:1px solid #3f3f46;border-radius:6px;cursor:pointer;transition:all 0.2s;font-family:'Inter';font-weight:500}
+            .btn-ghost:hover{color:#e4e4e7;border-color:#52525b;background:rgba(63,63,70,0.2)}
+            .btn-primary{color:#6366f1!important;border-color:#6366f1!important}
+            .btn-primary:hover{background:rgba(99,102,241,0.1)!important;color:#818cf8!important;border-color:#818cf8!important}
+            .tab-btn{padding:8px 20px;font-size:0.8rem;background:transparent;color:#71717a;border:1px solid #27272a;border-radius:6px;cursor:pointer;transition:all 0.2s;font-family:'Inter';font-weight:500}
+            .tab-btn:hover{color:#a1a1aa;border-color:#3f3f46}
+            .tab-active{background:rgba(99,102,241,0.12)!important;color:#818cf8!important;border-color:#6366f1!important}
+            .progress-bar{height:4px;background:#27272a;border-radius:2px;overflow:hidden}
+            .progress-fill{height:100%;background:linear-gradient(90deg,#6366f1,#818cf8);border-radius:2px;transition:width 0.4s ease}
+            .pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border-radius:12px;font-size:0.75rem;font-weight:500;letter-spacing:0.3px}
+            .pill-active{background:rgba(251,191,36,0.1);color:#fbbf24;border:1px solid rgba(251,191,36,0.2)}
+            .pill-completed{background:rgba(34,197,94,0.1);color:#4ade80;border:1px solid rgba(34,197,94,0.2)}
+            .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+            .dot-breathe{animation:breathe 2s ease-in-out infinite}
+            input{background:rgba(24,24,27,0.6);border:1px solid #27272a;color:#e4e4e7;padding:10px 14px;border-radius:6px;font-family:'Inter';font-size:0.875rem;transition:all 0.2s}
+            input:focus{outline:none;border-color:#3f3f46;background:rgba(24,24,27,0.8)}
+            input::placeholder{color:#52525b}
+            .table{width:100%;border-collapse:separate;border-spacing:0}
+            .table thead th{padding:12px 16px;text-align:left;font-size:0.7rem;font-weight:600;color:#71717a;text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid #27272a}
+            .table tbody tr{border-bottom:1px solid #18181b;transition:background 0.15s}
+            .table tbody tr:hover{background:rgba(24,24,27,0.4)}
+            .table tbody td{padding:14px 16px;color:#a1a1aa;font-size:0.875rem}
+            .mono{font-family:'JetBrains Mono',monospace;font-size:0.8em}
+            .stat-card-clickable{cursor:pointer}
+            .stat-card-clickable:hover{transform:translateY(-1px)}
+          `}</style>
+
+          {/* Header */}
+          <div style={{padding:'28px 48px',borderBottom:'1px solid #18181b',display:'flex',justifyContent:'space-between',alignItems:'center',animation:'fadeUp 0.3s ease-out'}}>
+            <div>
+              <h1 style={{fontSize:'1.75rem',fontWeight:'600',color:'#e4e4e7',marginBottom:'4px',letterSpacing:'-0.02em'}}>HSE Training Dashboard</h1>
+              <p style={{color:'#71717a',fontSize:'0.875rem'}}>Live data • Auto-updates</p>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:'16px'}}>
+              <div style={{fontSize:'0.875rem',color:'#71717a',fontFamily:'JetBrains Mono'}}>
+                {currentTime.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+              </div>
+              <button className="btn-ghost" onClick={loadData}>↻ Refresh</button>
+            </div>
+          </div>
+
+          <div style={{padding:'32px 48px'}}>
+
+            {/* Stat cards */}
+            <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(180px,1fr))',gap:'16px',marginBottom:'32px'}}>
+
+              {/* Current Batches */}
+              <div className="card stat-card-clickable" onClick={() => setActiveTab('current')}
+                style={{padding:'20px',animationDelay:'0.05s',borderColor: activeTab==='current' ? '#6366f1' : undefined}}>
+                <div style={{fontSize:'0.7rem',color:'#71717a',marginBottom:'6px',fontWeight:500,textTransform:'uppercase',letterSpacing:'0.5px'}}>Current Batches</div>
+                <div style={{fontSize:'2.5rem',fontWeight:'600',color:'#e4e4e7',lineHeight:'1'}}>{activeBatches.length}</div>
+                <div style={{fontSize:'0.7rem',color:'#6366f1',marginTop:'8px',opacity:0.8}}>Click to view ↓</div>
+              </div>
+
+              {/* Total Students */}
+              <div className="card" style={{padding:'20px',animationDelay:'0.08s'}}>
+                <div style={{fontSize:'0.7rem',color:'#71717a',marginBottom:'6px',fontWeight:500,textTransform:'uppercase',letterSpacing:'0.5px'}}>Total Students</div>
+                <div style={{fontSize:'2.5rem',fontWeight:'600',color:'#e4e4e7',lineHeight:'1'}}>{totalStudents}</div>
+                <div style={{fontSize:'0.7rem',color:'#71717a',marginTop:'8px'}}>Across active batches</div>
+              </div>
+
+              {/* Active */}
+              <div className="card stat-card-clickable" onClick={() => setActiveTab('active')}
+                style={{padding:'20px',animationDelay:'0.11s',borderColor: activeTab==='active' ? '#fbbf24' : undefined}}>
+                <div style={{fontSize:'0.7rem',color:'#71717a',marginBottom:'6px',fontWeight:500,textTransform:'uppercase',letterSpacing:'0.5px'}}>Active</div>
+                <div style={{fontSize:'2.5rem',fontWeight:'600',color:'#fbbf24',lineHeight:'1'}}>{activeBatches.length}</div>
+                <div style={{fontSize:'0.7rem',color:'#fbbf24',marginTop:'8px',opacity:0.7}}>Click to view ↓</div>
+              </div>
+
+              {/* Completed */}
+              <div className="card stat-card-clickable" onClick={() => setActiveTab('completed')}
+                style={{padding:'20px',animationDelay:'0.14s',borderColor: activeTab==='completed' ? '#4ade80' : undefined}}>
+                <div style={{fontSize:'0.7rem',color:'#71717a',marginBottom:'6px',fontWeight:500,textTransform:'uppercase',letterSpacing:'0.5px'}}>Completed</div>
+                <div style={{fontSize:'2.5rem',fontWeight:'600',color:'#4ade80',lineHeight:'1'}}>{completedBatches.length}</div>
+                <div style={{fontSize:'0.7rem',color:'#4ade80',marginTop:'8px',opacity:0.7}}>Click to view ↓</div>
+              </div>
+            </div>
+
+            {/* Tab bar */}
+            <div style={{display:'flex',gap:'10px',marginBottom:'24px',flexWrap:'wrap'}}>
+              <button className={`tab-btn${activeTab==='current'?' tab-active':''}`} onClick={() => setActiveTab('current')}>
+                Current Batches
+              </button>
+              <button className={`tab-btn${activeTab==='active'?' tab-active':''}`} onClick={() => setActiveTab('active')}>
+                🟡 Active ({activeBatches.length})
+              </button>
+              <button className={`tab-btn${activeTab==='completed'?' tab-active':''}`} onClick={() => setActiveTab('completed')}>
+                ✅ Completed ({completedBatches.length})
+              </button>
+            </div>
+
+            {/* Section label */}
+            <h2 style={{fontSize:'1rem',fontWeight:'600',color:'#71717a',marginBottom:'20px',letterSpacing:'0.02em',textTransform:'uppercase',fontSize:'0.78rem'}}>
+              {activeTab === 'completed' ? `Completed Batches — 139, 140, 141` : `Active Batches — 142, 143, 144`}
+            </h2>
+
+            {/* Batch cards */}
+            <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(370px,1fr))',gap:'16px'}}>
+              {displayedBatches.map((batch, idx) => (
+                <div key={batch.id} className="card" style={{padding:'22px',animationDelay:`${0.05+idx*0.05}s`}}>
+
+                  {/* Card header */}
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'start',marginBottom:'14px'}}>
+                    <h3 style={{fontSize:'1.4rem',fontWeight:'600',color:'#e4e4e7'}}>Batch {batch.id}</h3>
+                    <span className={batch.status==='Completed'?'pill pill-completed':'pill pill-active'}>
+                      {batch.status==='Active'&&<div className="dot dot-breathe"/>}
+                      {batch.status}
+                    </span>
+                  </div>
+
+                  {/* Dates */}
+                  <div style={{display:'grid',gridTemplateColumns:'1fr auto 1fr',gap:'8px',padding:'10px 14px',background:'rgba(24,24,27,0.6)',borderRadius:'6px',marginBottom:'14px',alignItems:'center'}}>
+                    <div>
+                      <div style={{fontSize:'0.6rem',color:'#52525b',marginBottom:'3px',textTransform:'uppercase',letterSpacing:'0.5px'}}>Start</div>
+                      <div className="mono" style={{fontSize:'0.78rem',color:'#a1a1aa',fontWeight:500}}>{batch.startDate}</div>
+                    </div>
+                    <div style={{color:'#3f3f46',fontSize:'1rem'}}>→</div>
+                    <div>
+                      <div style={{fontSize:'0.6rem',color:'#52525b',marginBottom:'3px',textTransform:'uppercase',letterSpacing:'0.5px'}}>End</div>
+                      <div className="mono" style={{fontSize:'0.78rem',color:'#a1a1aa',fontWeight:500}}>{batch.endDate}</div>
+                    </div>
+                  </div>
+
+                  {/* Stats — only for batches with sheet data */}
+                  {batch.hasStudentData ? (
+                    <>
+                      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:'10px',marginBottom:'14px'}}>
+                        <div>
+                          <div style={{fontSize:'0.65rem',color:'#71717a',marginBottom:'3px'}}>Assignments</div>
+                          <div style={{fontSize:'1rem',fontWeight:'600',color:'#e4e4e7'}}>{batch.assignmentsComplete}/{batch.students*5}</div>
+                        </div>
+                        <div>
+                          <div style={{fontSize:'0.65rem',color:'#71717a',marginBottom:'3px'}}>Feedback</div>
+                          <div style={{fontSize:'1rem',fontWeight:'600',color:'#e4e4e7'}}>{batch.feedbackComplete}/{batch.students*5}</div>
+                        </div>
+                        <div>
+                          <div style={{fontSize:'0.65rem',color:'#71717a',marginBottom:'3px'}}>Interviews</div>
+                          <div style={{fontSize:'1rem',fontWeight:'600',color:'#e4e4e7'}}>{batch.interviewsComplete}/{batch.students*2}</div>
+                        </div>
+                        <div>
+                          <div style={{fontSize:'0.65rem',color:'#71717a',marginBottom:'3px'}}>Students</div>
+                          <div style={{fontSize:'1rem',fontWeight:'600',color:'#e4e4e7'}}>{batch.students}</div>
+                        </div>
+                      </div>
+                      <div style={{marginBottom:'14px'}}>
+                        <div style={{display:'flex',justifyContent:'space-between',marginBottom:'5px',fontSize:'0.75rem'}}>
+                          <span style={{color:'#71717a'}}>Overall Progress</span>
+                          <span style={{color:'#e4e4e7',fontWeight:500}}>{batch.overallProgress}%</span>
+                        </div>
+                        <div className="progress-bar"><div className="progress-fill" style={{width:`${batch.overallProgress}%`}}/></div>
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{padding:'14px',background:'rgba(34,197,94,0.05)',border:'1px solid rgba(34,197,94,0.1)',borderRadius:'6px',marginBottom:'14px',textAlign:'center'}}>
+                      <div style={{fontSize:'0.8rem',color:'#4ade80',fontWeight:500}}>✓ Batch Completed</div>
+                      <div style={{fontSize:'0.7rem',color:'#52525b',marginTop:'4px'}}>Historical data archived</div>
+                    </div>
+                  )}
+
+                  {/* Buttons */}
+                  <div style={{display:'flex',gap:'8px'}}>
+                    {batch.hasStudentData && (
+                      <button className="btn-ghost btn-primary" style={{flex:1,fontSize:'0.8rem'}}
+                        onClick={() => { setSearchTerm(''); setSelectedBatch(batch); }}>
+                        View Students
+                      </button>
+                    )}
+                    {batch.driveLink ? (
+                      <a href={batch.driveLink} target="_blank" rel="noopener noreferrer" style={{textDecoration:'none',flex:1}}>
+                        <button className="btn-ghost" style={{width:'100%',fontSize:'0.8rem'}}>📁 Open Drive</button>
+                      </a>
+                    ) : (
+                      <button className="btn-ghost" style={{flex:1,fontSize:'0.8rem',opacity:0.35,cursor:'default'}} disabled>
+                        No Drive Link
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Student Modal */}
+          {selectedBatch && (
+            <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',backdropFilter:'blur(4px)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}
+                 onClick={() => setSelectedBatch(null)}>
+              <div className="card" style={{width:'92%',maxWidth:'1100px',maxHeight:'90vh',overflow:'auto',padding:'32px'}}
+                   onClick={e => e.stopPropagation()}>
+
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'20px'}}>
+                  <div>
+                    <h2 style={{fontSize:'1.4rem',fontWeight:'600',color:'#e4e4e7',marginBottom:'6px'}}>
+                      Batch {selectedBatch.id} — Student Details
+                    </h2>
+                    <div style={{display:'flex',gap:'20px',fontSize:'0.8rem',color:'#71717a'}}>
+                      <span>📅 {selectedBatch.startDate} → {selectedBatch.endDate}</span>
+                      <span>👥 {(studentData[selectedBatch.id]||[]).length} students</span>
+                    </div>
+                  </div>
+                  <button className="btn-ghost" onClick={() => setSelectedBatch(null)} style={{fontSize:'1.2rem',padding:'6px 12px'}}>✕</button>
+                </div>
+
+                <input type="text" placeholder="Search by name or ID..."
+                  value={searchTerm} onChange={e => setSearchTerm(e.target.value)}
+                  style={{width:'100%',marginBottom:'20px'}}/>
+
+                <table className="table">
+                  <thead>
+                    <tr><th>ID</th><th>Name</th><th>Assignments</th><th>Feedback</th><th>Interviews</th><th>Progress</th><th>Folder</th></tr>
+                  </thead>
+                  <tbody>
+                    {filteredStudents.map(student => (
+                      <tr key={student.id}>
+                        <td className="mono" style={{fontWeight:600,color:'#e4e4e7'}}>{student.id}</td>
+                        <td style={{fontWeight:500,color:'#e4e4e7'}}>{student.name}</td>
+                        <td><span style={{color:student.assignments===5?'#4ade80':'#fbbf24',fontWeight:500}}>{student.assignments}/5</span></td>
+                        <td><span style={{color:student.feedback===5?'#4ade80':'#fbbf24',fontWeight:500}}>{student.feedback}/5</span></td>
+                        <td><span style={{color:student.interviews===2?'#4ade80':'#fbbf24',fontWeight:500}}>{student.interviews}/2</span></td>
+                        <td>
+                          <div style={{display:'flex',alignItems:'center',gap:'8px'}}>
+                            <div style={{width:'80px'}}>
+                              <div className="progress-bar"><div className="progress-fill" style={{width:`${student.progress}%`}}/></div>
+                            </div>
+                            <span style={{fontSize:'0.72rem',color:'#71717a'}}>{student.progress}%</span>
+                          </div>
+                        </td>
+                        <td>
+                          {student.folder
+                            ? <a href={student.folder} target="_blank" rel="noopener noreferrer" style={{textDecoration:'none'}}>
+                                <button className="btn-ghost" style={{padding:'5px 10px',fontSize:'0.72rem'}}>Open</button>
+                              </a>
+                            : <span style={{color:'#3f3f46',fontSize:'0.75rem'}}>—</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.render(<TrainingDashboard />, document.getElementById('root'));
+  </script>
+</body>
+</html>
