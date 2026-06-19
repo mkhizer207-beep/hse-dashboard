@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>HSE Training Dashboard</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Inter', -apple-system, system-ui, sans-serif; background: #080d14; color: #e4e4e7; min-height: 100vh; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    // ── Sheet URLs ─────────────────────────────────────────────────────────────
+    const COMPLETED_URL  = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSTNo_R-1F799Vvs11t0EG_kMkWqFOrbA9v4ShwysswLR_xvfWraTTv5LFvyCoguw/pub?gid=1010182894&single=true&output=csv';
+    const ACTIVE_URL     = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSTNo_R-1F799Vvs11t0EG_kMkWqFOrbA9v4ShwysswLR_xvfWraTTv5LFvyCoguw/pub?gid=1469122969&single=true&output=csv';
+    const BATCH_INFO_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSTNo_R-1F799Vvs11t0EG_kMkWqFOrbA9v4ShwysswLR_xvfWraTTv5LFvyCoguw/pub?gid=2081842441&single=true&output=csv';
+
+    // ── Max per student ────────────────────────────────────────────────────────
+    const MAX_ASSIGNMENTS = 3;
+    const MAX_FEEDBACK    = 3;
+    const MAX_INTERVIEWS  = 2;
+
+    // ── Day letter map ─────────────────────────────────────────────────────────
+    const DAY_LETTER = ['S','M','T','W','T','F','S']; // 0=Sun,1=Mon,...,6=Sat
+    const DAY_NAME   = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    const MONTH_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+    // ── Parse date strings like "21 Apr 2026" or "21 Apr2026" ─────────────────
+    function parseDate(str) {
+      if (!str) return null;
+      // Remove commas, normalize spaces
+      str = str.toString().trim().replace(/,/g,' ').replace(/\s+/,' ');
+      // Match: day + month letters + year (2-4 digits)
+      const m = str.match(/(\d{1,2})\s*([A-Za-z]+)\s*(\d{2,4})/);
+      if (!m) return null;
+      const day   = parseInt(m[1]);
+      const months = ['jan','feb','mar','apr','may','jun','jul','aug','sep','oct','nov','dec'];
+      const month = months.indexOf(m[2].toLowerCase().slice(0,3));
+      let year    = parseInt(m[3]);
+      // Fix common typos: 0202 → 2026, any year < 100 → 2000+year, 202 → 2026
+      if (year < 1000) {
+        // Reverse digits if looks like typo (e.g. 0202 → 2020 close to 2026)
+        const reversed = parseInt(m[3].split('').reverse().join(''));
+        if (reversed >= 2020 && reversed <= 2030) year = reversed;
+        else year = 2000 + year;
+      }
+      if (month < 0) return null;
+      return new Date(year, month, day);
+    }
+
+    // ── Format date as "21 Apr" ────────────────────────────────────────────────
+    function fmtDate(d) {
+      return `${d.getDate()} ${MONTH_SHORT[d.getMonth()]}`;
+    }
+
+    // ── Generate class slots from start, end, type ─────────────────────────────
+    // Full Time: include all days (Sun ON)
+    // Part Time: exclude Sundays (Sun OFF)
+    function generateClassDates(startDate, endDate, batchType) {
+      if (!startDate || !endDate) return [];
+      const isFullTime = batchType && batchType.toLowerCase().includes('full');
+      const slots = [];
+      const cur = new Date(startDate);
+      while (cur <= endDate) {
+        const dow = cur.getDay(); // 0=Sun
+        if (isFullTime || dow !== 0) {
+          slots.push(new Date(cur));
+        }
+        cur.setDate(cur.getDate() + 1);
+      }
+      return slots;
+    }
+
+    // ── Parse class status from cell value ────────────────────────────────────
+    // "done" → {type:'done'}
+    // "online:url" → {type:'online', url}
+    // "missed:reason" OR "miss:reason" → {type:'missed', reason}
+    // "" / null → {type:'pending'}
+    function parseClassStatus(val) {
+      if (!val || val.toString().trim() === '') return { type: 'pending' };
+      const v = val.toString().trim().toLowerCase();
+      if (v === 'done') return { type: 'done' };
+      if (v.startsWith('online:')) return { type: 'online', url: val.toString().trim().slice(7) };
+      if (v.startsWith('online')) return { type: 'online', url: '' };
+      if (v.startsWith('missed:')) return { type: 'missed', reason: val.toString().trim().slice(7) };
+      if (v.startsWith('miss:')) return { type: 'missed', reason: val.toString().trim().slice(5) };
+      if (v === 'missed' || v === 'miss') return { type: 'missed', reason: '' };
+      return { type: 'pending' };
+    }
+
+    // ── Fetch + parse CSV ──────────────────────────────────────────────────────
+    function fetchCSV(url) {
+      return fetch(url).then(r => { if (!r.ok) throw new Error('Failed to fetch'); return r.text(); });
+    }
+    function parseCSV(text) {
+      return new Promise((resolve, reject) =>
+        Papa.parse(text, { header: true, skipEmptyLines: true,
+          complete: r => resolve(r.data), error: e => reject(e) })
+      );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    function TrainingDashboard() {
+      const [batches,       setBatches]       = useState([]);
+      const [studentData,   setStudentData]   = useState({});
+      const [batchInfoMap,  setBatchInfoMap]  = useState({});
+      const [loading,       setLoading]       = useState(true);
+      const [error,         setError]         = useState(null);
+      const [selectedBatch, setSelectedBatch] = useState(null);
+      const [searchTerm,    setSearchTerm]    = useState('');
+      const [currentTime,   setCurrentTime]   = useState(new Date());
+      const [activeTab,     setActiveTab]     = useState('active');
+      const [classPopup,    setClassPopup]    = useState(null); // {batchId, classIdx, status}
+
+      useEffect(() => {
+        const t = setInterval(() => setCurrentTime(new Date()), 1000);
+        return () => clearInterval(t);
+      }, []);
+
+      useEffect(() => { loadData(); }, []);
+
+      const loadData = async () => {
+        try {
+          setLoading(true); setError(null);
+          const [cCSV, aCSV, bCSV] = await Promise.all([
+            fetchCSV(COMPLETED_URL), fetchCSV(ACTIVE_URL), fetchCSV(BATCH_INFO_URL)
+          ]);
+          const [cRows, aRows, bRows] = await Promise.all([
+            parseCSV(cCSV), parseCSV(aCSV), parseCSV(bCSV)
+          ]);
+
+          // ── Process Batch Info ──────────────────────────────────────────────
+          const infoMap = {};
+          bRows.forEach(row => {
+            const bid = parseInt(row['Batch'] || row['batch']);
+            if (!bid) return;
+            const startDate = parseDate(row['Start_Date'] || row['start_date']);
+            const endDate   = parseDate(row['End_Date']   || row['end_date']);
+            const batchType = (row['Batch_Type'] || row['batch_type'] || '').trim();
+            const slots = generateClassDates(startDate, endDate, batchType);
+            const totalClassesRaw = parseInt(row['Total_Classes'] || row['total_classes'] || 0) || 0;
+            // Use whichever is larger: calculated slots or sheet Total_Classes
+            const classCount = Math.max(slots.length, totalClassesRaw);
+
+            // Collect class statuses: Class_1, Class_2, ...
+            const classes = [];
+            for (let i = 1; i <= classCount; i++) {
+              const key = `Class_${i}`;
+              const val = row[key] || row[key.toLowerCase()] || '';
+              classes.push({
+                number: i,
+                date:   slots[i-1] || null,
+                status: parseClassStatus(val)
+              });
+            }
+
+            infoMap[bid] = {
+              startDate:     row['Start_Date']             || row['start_date']             || '',
+              endDate:       row['End_Date']               || row['end_date']               || '',
+              batchType:     batchType,
+              classTimings:  row['Class_Timings']          || row['class_timings']          || '',
+              driveLink:     row['Batch_Drive_Link']       || row['batch_drive_link']       || '',
+              hseTrainer:    row['HSE_Trainer']            || row['hse_trainer']            || '',
+              hseLinTrainer: row['HSE_Linguistic_Trainer'] || row['hse_linguistic_trainer'] || '',
+              totalClasses:  classCount,
+              classes,
+            };
+          });
+          setBatchInfoMap(infoMap);
+
+          // ── Process Student Rows ────────────────────────────────────────────
+          const studentsByBatch = {};
+          const tagged = [
+            ...cRows.map(r => ({ ...r, _sheet: 'Completed' })),
+            ...aRows.map(r => ({ ...r, _sheet: 'Active'    })),
+          ];
+
+          tagged.forEach(row => {
+            const bid = parseInt(row['Batch'] || row['batch']);
+            if (!bid) return;
+            if (!studentsByBatch[bid]) studentsByBatch[bid] = { rows: [], sheet: row._sheet };
+            const sid = String(row['Student ID'] || row['Student_ID'] || '').trim();
+            if (!sid) return;
+            const assignments = parseInt(row['Assignments'] || 0) || 0;
+            const feedback    = parseInt(row['Feedbacks']   || row['Feedback'] || 0) || 0;
+            const interviews  = parseInt(row['Interviews']  || 0) || 0;
+            const progress    = Math.round(
+              (assignments/MAX_ASSIGNMENTS + feedback/MAX_FEEDBACK + interviews/MAX_INTERVIEWS) / 3 * 100
+            );
+            studentsByBatch[bid].rows.push({
+              id: sid.includes('.') ? String(parseInt(sid)).padStart(3,'0') : sid.padStart(3,'0'),
+              name: row['Student Name'] || row['Student_Name'] || 'Unknown',
+              assignments, feedback, interviews, progress,
+              folder: row['Folder_Link'] || ''
+            });
+          });
+
+          setStudentData(Object.fromEntries(
+            Object.entries(studentsByBatch).map(([k,v]) => [k, v.rows])
+          ));
+
+          // ── Build Batch List ────────────────────────────────────────────────
+          const allBatches = Object.entries(studentsByBatch).map(([bid, val]) => {
+            const id       = parseInt(bid);
+            const students = val.rows;
+            const info     = infoMap[id] || {};
+            const sheet    = val.sheet;
+            return {
+              id,
+              status:        sheet === 'Completed' ? 'Completed' : 'Active',
+              startDate:     info.startDate     || '—',
+              endDate:       info.endDate       || '—',
+              batchType:     info.batchType     || '',
+              classTimings:  info.classTimings  || '',
+              driveLink:     info.driveLink     || '',
+              hseTrainer:    info.hseTrainer    || '',
+              hseLinTrainer: info.hseLinTrainer || '',
+              totalClasses:  info.totalClasses  || 0,
+              classes:       info.classes       || [],
+              hasInfo:       !!infoMap[id],
+              students:             students.length,
+              assignmentsComplete:  students.reduce((s,x) => s + x.assignments, 0),
+              feedbackComplete:     students.reduce((s,x) => s + x.feedback,    0),
+              interviewsComplete:   students.reduce((s,x) => s + x.interviews,  0),
+              overallProgress:      Math.round(students.reduce((s,x) => s + x.progress, 0) / (students.length || 1)),
+            };
+          }).sort((a,b) => a.id - b.id);
+
+          setBatches(allBatches);
+          setLoading(false);
+        } catch(err) {
+          setError(err.message);
+          setLoading(false);
+        }
+      };
+
+      const activeBatches    = batches.filter(b => b.status === 'Active');
+      const completedBatches = batches.filter(b => b.status === 'Completed');
+      const displayedBatches = activeTab === 'active' ? activeBatches : completedBatches;
+
+      const filteredStudents = selectedBatch
+        ? (studentData[selectedBatch.id] || []).filter(s =>
+            s.name.toLowerCase().includes(searchTerm.toLowerCase()) || s.id.includes(searchTerm))
+        : [];
+
+      // ── Class box color ──────────────────────────────────────────────────────
+      function classBoxStyle(type) {
+        const base = { width:'36px', height:'36px', borderRadius:'8px', display:'flex', flexDirection:'column',
+                       alignItems:'center', justifyContent:'center', fontSize:'0.6rem',
+                       fontWeight:'600', cursor:'default', border:'1px solid', transition:'all 0.15s',
+                       position:'relative', flexShrink:0 };
+        if (type === 'done')    return { ...base, background:'rgba(74,222,128,0.15)',   borderColor:'rgba(74,222,128,0.4)',  color:'#4ade80' };
+        if (type === 'online')  return { ...base, background:'rgba(96,165,250,0.15)',   borderColor:'rgba(96,165,250,0.4)',  color:'#60a5fa', cursor:'pointer' };
+        if (type === 'missed')  return { ...base, background:'rgba(248,113,113,0.15)',  borderColor:'rgba(248,113,113,0.4)', color:'#f87171', cursor:'pointer' };
+        return                         { ...base, background:'rgba(63,63,70,0.2)',      borderColor:'#27272a',               color:'#52525b' };
+      }
+
+      if (loading) return (
+        <div style={{minHeight:'100vh',background:'#080d14',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',gap:'16px',color:'#a1a1aa',fontFamily:'Inter'}}>
+          <div style={{width:'40px',height:'40px',border:'3px solid #27272a',borderTop:'3px solid #6366f1',borderRadius:'50%',animation:'spin 1s linear infinite'}}/>
+          <div>Loading dashboard...</div>
+          <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+        </div>
+      );
+
+      if (error) return (
+        <div style={{minHeight:'100vh',background:'#080d14',display:'flex',alignItems:'center',justifyContent:'center',flexDirection:'column',gap:'12px',padding:'40px',fontFamily:'Inter'}}>
+          <div style={{fontSize:'2rem',opacity:0.5}}>⚠</div>
+          <div style={{fontSize:'1.1rem',color:'#e4e4e7'}}>Error Loading Data</div>
+          <div style={{fontSize:'0.85rem',color:'#71717a'}}>{error}</div>
+          <button onClick={loadData} style={{marginTop:'12px',padding:'10px 24px',background:'transparent',color:'#6366f1',border:'1px solid #6366f1',borderRadius:'6px',cursor:'pointer',fontFamily:'Inter',fontSize:'0.875rem'}}>Try Again</button>
+        </div>
+      );
+
+      return (
+        <div style={{minHeight:'100vh',background:'#080d14',backgroundImage:'linear-gradient(to right,#18181b 1px,transparent 1px),linear-gradient(to bottom,#18181b 1px,transparent 1px)',backgroundSize:'60px 60px',fontFamily:'Inter'}}>
+          <style>{`
+            @keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+            @keyframes breathe{0%,100%{opacity:1}50%{opacity:0.3}}
+            @keyframes spin{to{transform:rotate(360deg)}}
+            .card{background:rgba(24,24,27,0.5);border:1px solid #27272a;border-radius:10px;backdrop-filter:blur(10px);animation:fadeUp 0.4s ease-out both}
+            .card:hover{border-color:#3f3f46}
+            .btn{padding:8px 16px;font-size:0.82rem;background:transparent;color:#a1a1aa;border:1px solid #3f3f46;border-radius:6px;cursor:pointer;transition:all 0.2s;font-family:'Inter';font-weight:500}
+            .btn:hover{color:#e4e4e7;border-color:#52525b;background:rgba(63,63,70,0.2)}
+            .btn-blue{color:#6366f1!important;border-color:#6366f1!important}
+            .btn-blue:hover{background:rgba(99,102,241,0.1)!important;color:#818cf8!important}
+            .tab{padding:10px 22px;font-size:0.85rem;background:transparent;border-radius:8px;cursor:pointer;transition:all 0.2s;font-family:'Inter';font-weight:500;border:1px solid #27272a;color:#71717a}
+            .tab:hover{color:#a1a1aa;border-color:#3f3f46}
+            .tab-y{background:rgba(251,191,36,0.1)!important;color:#fbbf24!important;border-color:#fbbf24!important}
+            .tab-g{background:rgba(74,222,128,0.1)!important;color:#4ade80!important;border-color:#4ade80!important}
+            .pbar{height:4px;background:#27272a;border-radius:2px;overflow:hidden}
+            .pfill{height:100%;background:linear-gradient(90deg,#6366f1,#818cf8);border-radius:2px;transition:width 0.5s ease}
+            .pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:12px;font-size:0.72rem;font-weight:500;letter-spacing:0.3px}
+            .pill-a{background:rgba(251,191,36,0.1);color:#fbbf24;border:1px solid rgba(251,191,36,0.25)}
+            .pill-c{background:rgba(74,222,128,0.1);color:#4ade80;border:1px solid rgba(74,222,128,0.25)}
+            .pill-ft{background:rgba(139,92,246,0.1);color:#a78bfa;border:1px solid rgba(139,92,246,0.25)}
+            .pill-pt{background:rgba(251,146,60,0.1);color:#fb923c;border:1px solid rgba(251,146,60,0.25)}
+            .dot-blink{width:6px;height:6px;border-radius:50%;background:currentColor;animation:breathe 2s ease-in-out infinite}
+            input{background:rgba(24,24,27,0.6);border:1px solid #27272a;color:#e4e4e7;padding:10px 14px;border-radius:6px;font-family:'Inter';font-size:0.875rem;transition:all 0.2s;width:100%}
+            input:focus{outline:none;border-color:#3f3f46}
+            input::placeholder{color:#52525b}
+            .tbl{width:100%;border-collapse:separate;border-spacing:0}
+            .tbl th{padding:10px 14px;text-align:left;font-size:0.68rem;font-weight:600;color:#71717a;text-transform:uppercase;letter-spacing:0.8px;border-bottom:1px solid #27272a}
+            .tbl td{padding:12px 14px;color:#a1a1aa;font-size:0.85rem;border-bottom:1px solid #18181b}
+            .tbl tr:hover td{background:rgba(24,24,27,0.4)}
+            .mono{font-family:'JetBrains Mono',monospace}
+            .class-box:hover{transform:scale(1.1);z-index:10}
+          `}</style>
+
+          {/* ── Header ── */}
+          <div style={{padding:'24px 44px',borderBottom:'1px solid #18181b',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <div>
+              <h1 style={{fontSize:'1.6rem',fontWeight:'700',color:'#e4e4e7',letterSpacing:'-0.02em',marginBottom:'4px'}}>
+                HSE Training Dashboard
+              </h1>
+              <p style={{color:'#52525b',fontSize:'0.8rem'}}>Live · Auto-syncs with Google Sheets</p>
+            </div>
+            <div style={{display:'flex',alignItems:'center',gap:'14px'}}>
+              <span className="mono" style={{fontSize:'0.82rem',color:'#52525b'}}>
+                {currentTime.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit',second:'2-digit'})}
+              </span>
+              <button className="btn" onClick={loadData}>↻ Refresh</button>
+            </div>
+          </div>
+
+          <div style={{padding:'28px 44px'}}>
+
+            {/* ── Stat Cards ── */}
+            <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(160px,1fr))',gap:'14px',marginBottom:'28px'}}>
+              {[
+                {label:'Total Students',   value: activeBatches.reduce((s,b)=>s+b.students,0), color:'#e4e4e7', sub:'Active batches'},
+                {label:'Active Batches',   value: activeBatches.length,    color:'#fbbf24', sub:'Currently running'},
+                {label:'Completed Batches',value: completedBatches.length, color:'#4ade80', sub:'Finished'},
+                {label:'Total Batches',    value: batches.length,          color:'#818cf8', sub:'All time'},
+              ].map((s,i) => (
+                <div key={i} className="card" style={{padding:'18px',animationDelay:`${i*0.05}s`}}>
+                  <div style={{fontSize:'0.68rem',color:'#71717a',marginBottom:'6px',textTransform:'uppercase',letterSpacing:'0.5px',fontWeight:500}}>{s.label}</div>
+                  <div style={{fontSize:'2.2rem',fontWeight:'700',color:s.color,lineHeight:1}}>{s.value}</div>
+                  <div style={{fontSize:'0.68rem',color:'#3f3f46',marginTop:'6px'}}>{s.sub}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* ── Summary Bar (Active only) ── */}
+            {activeBatches.length > 0 && (
+              <div className="card" style={{padding:'20px 24px',marginBottom:'28px',display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:'28px',animationDelay:'0.2s'}}>
+                {[
+                  {label:'Total Assignments', val: activeBatches.reduce((s,b)=>s+b.assignmentsComplete,0), max: activeBatches.reduce((s,b)=>s+b.students*MAX_ASSIGNMENTS,0), color:'#818cf8', grad:'#818cf8,#6366f1'},
+                  {label:'Total Feedbacks',   val: activeBatches.reduce((s,b)=>s+b.feedbackComplete,0),    max: activeBatches.reduce((s,b)=>s+b.students*MAX_FEEDBACK,0),    color:'#ec4899', grad:'#ec4899,#f43f5e'},
+                  {label:'Total Interviews',  val: activeBatches.reduce((s,b)=>s+b.interviewsComplete,0),  max: activeBatches.reduce((s,b)=>s+b.students*MAX_INTERVIEWS,0),  color:'#10b981', grad:'#10b981,#06b6d4'},
+                ].map((item,i) => (
+                  <div key={i}>
+                    <div style={{fontSize:'0.68rem',color:'#71717a',marginBottom:'8px',textTransform:'uppercase',letterSpacing:'0.5px',fontWeight:500}}>{item.label} (Active)</div>
+                    <div style={{display:'flex',alignItems:'baseline',gap:'6px',marginBottom:'8px'}}>
+                      <span style={{fontSize:'1.8rem',fontWeight:'700',color:item.color}}>{item.val}</span>
+                      <span style={{fontSize:'0.8rem',color:'#3f3f46'}}>/ {item.max}</span>
+                    </div>
+                    <div className="pbar">
+                      <div className="pfill" style={{width:`${item.max>0?item.val/item.max*100:0}%`,background:`linear-gradient(90deg,${item.grad})`}}/>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* ── Tab Buttons ── */}
+            <div style={{display:'flex',gap:'10px',marginBottom:'24px'}}>
+              <button className={`tab${activeTab==='active'?' tab-y':''}`} onClick={()=>setActiveTab('active')}>
+                🟡 Active Batches ({activeBatches.length})
+              </button>
+              <button className={`tab${activeTab==='completed'?' tab-g':''}`} onClick={()=>setActiveTab('completed')}>
+                ✅ Completed Batches ({completedBatches.length})
+              </button>
+            </div>
+
+            {/* ── Section label ── */}
+            <div style={{fontSize:'0.7rem',color:'#3f3f46',marginBottom:'18px',textTransform:'uppercase',letterSpacing:'0.1em',fontWeight:600}}>
+              {activeTab==='active'
+                ? `Active — ${activeBatches.map(b=>b.id).join(', ')}`
+                : `Completed — ${completedBatches.map(b=>b.id).join(', ')}`}
+            </div>
+
+            {/* ── Batch Cards ── */}
+            <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fill,minmax(400px,1fr))',gap:'16px'}}>
+              {displayedBatches.map((batch, idx) => (
+                <div key={batch.id} className="card" style={{padding:'22px',animationDelay:`${0.05+idx*0.06}s`}}>
+
+                  {/* Card Header */}
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'start',marginBottom:'14px'}}>
+                    <div style={{display:'flex',alignItems:'center',gap:'10px'}}>
+                      <h3 style={{fontSize:'1.4rem',fontWeight:'700',color:'#e4e4e7'}}>Batch {batch.id}</h3>
+                      {batch.batchType && (
+                        <span className={batch.batchType.toLowerCase().includes('full')?'pill pill-ft':'pill pill-pt'}>
+                          {batch.batchType}
+                        </span>
+                      )}
+                    </div>
+                    <span className={batch.status==='Active'?'pill pill-a':'pill pill-c'}>
+                      {batch.status==='Active' && <div className="dot-blink"/>}
+                      {batch.status}
+                    </span>
+                  </div>
+
+                  {/* No info notice */}
+                  {!batch.hasInfo && (
+                    <div style={{background:'rgba(251,191,36,0.05)',border:'1px solid rgba(251,191,36,0.15)',borderRadius:'6px',padding:'10px 14px',marginBottom:'14px',fontSize:'0.75rem',color:'#92400e'}}>
+                      ⚠️ Add this batch to your <strong style={{color:'#fbbf24'}}>Batch Info sheet</strong> to show dates, trainers & class tracking
+                    </div>
+                  )}
+
+                  {/* Dates + Timing */}
+                  <div style={{background:'rgba(14,14,18,0.6)',borderRadius:'8px',padding:'12px 14px',marginBottom:'14px',border:'1px solid #1f1f23'}}>
+                    <div style={{display:'grid',gridTemplateColumns:'1fr auto 1fr',alignItems:'center',gap:'8px',marginBottom: batch.classTimings?'8px':'0'}}>
+                      <div>
+                        <div style={{fontSize:'0.6rem',color:'#52525b',marginBottom:'3px',textTransform:'uppercase',letterSpacing:'0.5px'}}>Start</div>
+                        <div className="mono" style={{fontSize:'0.8rem',color:'#a1a1aa',fontWeight:500}}>{batch.startDate}</div>
+                      </div>
+                      <div style={{color:'#3f3f46',fontSize:'1rem'}}>→</div>
+                      <div>
+                        <div style={{fontSize:'0.6rem',color:'#52525b',marginBottom:'3px',textTransform:'uppercase',letterSpacing:'0.5px'}}>End</div>
+                        <div className="mono" style={{fontSize:'0.8rem',color:'#a1a1aa',fontWeight:500}}>{batch.endDate}</div>
+                      </div>
+                    </div>
+                    {batch.classTimings && (
+                      <div style={{borderTop:'1px solid #27272a',paddingTop:'8px',display:'flex',alignItems:'center',gap:'6px'}}>
+                        <span style={{fontSize:'0.7rem',color:'#52525b'}}>⏰</span>
+                        <span className="mono" style={{fontSize:'0.78rem',color:'#a1a1aa'}}>{batch.classTimings}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Trainers */}
+                  {(batch.hseTrainer || batch.hseLinTrainer) && (
+                    <div style={{marginBottom:'14px',display:'flex',flexDirection:'column',gap:'6px'}}>
+                      {batch.hseTrainer && (
+                        <div style={{display:'flex',alignItems:'center',gap:'8px'}}>
+                          <span style={{fontSize:'0.7rem',color:'#52525b',minWidth:'140px'}}>👨‍🏫 HSE Trainer</span>
+                          <span style={{fontSize:'0.82rem',color:'#a1a1aa',fontWeight:500}}>{batch.hseTrainer}</span>
+                        </div>
+                      )}
+                      {batch.hseLinTrainer && (
+                        <div style={{display:'flex',alignItems:'center',gap:'8px'}}>
+                          <span style={{fontSize:'0.7rem',color:'#52525b',minWidth:'140px'}}>👨‍🎓 HSE Linguistic Trainer</span>
+                          <span style={{fontSize:'0.82rem',color:'#a1a1aa',fontWeight:500}}>{batch.hseLinTrainer}</span>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Student Stats */}
+                  <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:'10px',marginBottom:'14px'}}>
+                    {[
+                      {label:'Students',    value:`${batch.students}`},
+                      {label:'Assignments', value:`${batch.assignmentsComplete}/${batch.students*MAX_ASSIGNMENTS}`},
+                      {label:'Feedback',    value:`${batch.feedbackComplete}/${batch.students*MAX_FEEDBACK}`},
+                      {label:'Interviews',  value:`${batch.interviewsComplete}/${batch.students*MAX_INTERVIEWS}`},
+                    ].map((s,i) => (
+                      <div key={i} style={{background:'rgba(14,14,18,0.4)',borderRadius:'6px',padding:'8px',border:'1px solid #1f1f23'}}>
+                        <div style={{fontSize:'0.6rem',color:'#52525b',marginBottom:'4px'}}>{s.label}</div>
+                        <div style={{fontSize:'0.95rem',fontWeight:'600',color:'#e4e4e7'}}>{s.value}</div>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Progress Bar */}
+                  <div style={{marginBottom:'16px'}}>
+                    <div style={{display:'flex',justifyContent:'space-between',marginBottom:'5px',fontSize:'0.72rem'}}>
+                      <span style={{color:'#71717a'}}>Overall Progress</span>
+                      <span style={{color:'#e4e4e7',fontWeight:500}}>{batch.overallProgress}%</span>
+                    </div>
+                    <div className="pbar"><div className="pfill" style={{width:`${batch.overallProgress}%`}}/></div>
+                  </div>
+
+                  {/* ── Class Tracking ── */}
+                  {batch.classes && batch.classes.length > 0 && (
+                    <div style={{marginBottom:'16px'}}>
+                      <div style={{fontSize:'0.68rem',color:'#52525b',marginBottom:'10px',textTransform:'uppercase',letterSpacing:'0.5px',fontWeight:600,display:'flex',alignItems:'center',gap:'8px'}}>
+                        <span>Class Progress</span>
+                        <span style={{color:'#3f3f46'}}>({batch.classes.filter(c=>c.status.type==='done'||c.status.type==='online').length}/{batch.classes.length})</span>
+                      </div>
+                      <div style={{display:'flex',flexWrap:'wrap',gap:'6px'}}>
+                        {batch.classes.map((cls, ci) => {
+                          const s = cls.status;
+                          const isClickable = s.type === 'missed' || s.type === 'online';
+                          const dow = cls.date ? cls.date.getDay() : null;
+                          const dayLetter = dow !== null ? DAY_LETTER[dow] : '';
+                          const dateLabel = cls.date ? `${cls.date.getDate()} ${MONTH_SHORT[cls.date.getMonth()]}` : '';
+                          const icon = s.type==='done' ? '✓' : s.type==='online' ? '●' : s.type==='missed' ? '✕' : '';
+                          return (
+                            <div
+                              key={ci}
+                              className="class-box"
+                              style={{
+                                ...classBoxStyle(s.type),
+                                width:'42px',
+                                height:'52px',
+                                cursor: isClickable ? 'pointer' : 'default',
+                                flexDirection:'column',
+                                gap:'1px',
+                              }}
+                              title={isClickable ? (s.type==='missed' ? `Missed: ${s.reason}` : 'Online class') : ''}
+                              onClick={() => {
+                                if (isClickable) setClassPopup({ batchId: batch.id, cls, batchName: batch.id });
+                              }}
+                            >
+                              <div style={{fontSize:'0.65rem',fontWeight:'700',color:'inherit',lineHeight:1}}>{dayLetter}</div>
+                              <div style={{fontSize:'0.55rem',color:'inherit',opacity:0.7,lineHeight:1}}>{dateLabel}</div>
+                              <div style={{fontSize:'0.7rem',fontWeight:'700',lineHeight:1}}>{icon || cls.number}</div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      {/* Legend */}
+                      <div style={{display:'flex',gap:'12px',marginTop:'8px',flexWrap:'wrap'}}>
+                        {[
+                          {color:'#4ade80',label:'Done'},
+                          {color:'#60a5fa',label:'Online'},
+                          {color:'#f87171',label:'Missed'},
+                          {color:'#3f3f46',label:'Pending'},
+                        ].map((l,i) => (
+                          <div key={i} style={{display:'flex',alignItems:'center',gap:'4px'}}>
+                            <div style={{width:'8px',height:'8px',borderRadius:'2px',background:l.color,opacity:0.8}}/>
+                            <span style={{fontSize:'0.65rem',color:'#52525b'}}>{l.label}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Action Buttons */}
+                  <div style={{display:'flex',gap:'8px'}}>
+                    <button className="btn btn-blue" style={{flex:1}}
+                      onClick={() => { setSearchTerm(''); setSelectedBatch(batch); }}>
+                      View Students
+                    </button>
+                    {batch.driveLink
+                      ? <a href={batch.driveLink} target="_blank" rel="noopener noreferrer" style={{textDecoration:'none',flex:1}}>
+                          <button className="btn" style={{width:'100%'}}>📁 Open Drive</button>
+                        </a>
+                      : <button className="btn" style={{flex:1,opacity:0.3,cursor:'default'}} disabled>No Drive Link</button>
+                    }
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* ══ Class Popup ══ */}
+          {classPopup && (
+            <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.8)',backdropFilter:'blur(6px)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:2000}}
+                 onClick={() => setClassPopup(null)}>
+              <div className="card" style={{padding:'28px',minWidth:'320px',maxWidth:'420px',width:'90%',animation:'fadeUp 0.2s ease-out'}}
+                   onClick={e => e.stopPropagation()}>
+                {classPopup.cls.status.type === 'missed' ? (
+                  <>
+                    <div style={{display:'flex',alignItems:'center',gap:'10px',marginBottom:'16px'}}>
+                      <div style={{width:'36px',height:'36px',borderRadius:'8px',background:'rgba(248,113,113,0.15)',border:'1px solid rgba(248,113,113,0.3)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1rem'}}>✕</div>
+                      <div>
+                        <div style={{fontSize:'1rem',fontWeight:'600',color:'#f87171'}}>Class {classPopup.cls.number} — Missed</div>
+                        <div style={{fontSize:'0.75rem',color:'#71717a'}}>
+                          Batch {classPopup.batchName} · {classPopup.cls.date ? `${DAY_NAME[classPopup.cls.date.getDay()]} ${fmtDate(classPopup.cls.date)}` : ''}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{background:'rgba(14,14,18,0.6)',borderRadius:'8px',padding:'14px',border:'1px solid #27272a'}}>
+                      <div style={{fontSize:'0.68rem',color:'#71717a',marginBottom:'6px',textTransform:'uppercase',letterSpacing:'0.5px'}}>Reason</div>
+                      <div style={{fontSize:'0.9rem',color:'#e4e4e7',lineHeight:'1.5'}}>
+                        {classPopup.cls.status.reason || 'No reason provided'}
+                      </div>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div style={{display:'flex',alignItems:'center',gap:'10px',marginBottom:'16px'}}>
+                      <div style={{width:'36px',height:'36px',borderRadius:'8px',background:'rgba(96,165,250,0.15)',border:'1px solid rgba(96,165,250,0.3)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'1rem'}}>●</div>
+                      <div>
+                        <div style={{fontSize:'1rem',fontWeight:'600',color:'#60a5fa'}}>Class {classPopup.cls.number} — Conducted Online</div>
+                        <div style={{fontSize:'0.75rem',color:'#71717a'}}>
+                          Batch {classPopup.batchName} · {classPopup.cls.date ? `${DAY_NAME[classPopup.cls.date.getDay()]} ${fmtDate(classPopup.cls.date)}` : ''}
+                        </div>
+                      </div>
+                    </div>
+                    <div style={{background:'rgba(14,14,18,0.6)',borderRadius:'8px',padding:'14px',border:'1px solid #27272a'}}>
+                      <div style={{fontSize:'0.68rem',color:'#71717a',marginBottom:'10px',textTransform:'uppercase',letterSpacing:'0.5px'}}>Zoom Recording</div>
+                      {classPopup.cls.status.url
+                        ? <a href={classPopup.cls.status.url} target="_blank" rel="noopener noreferrer" style={{textDecoration:'none'}}>
+                            <button className="btn" style={{width:'100%',color:'#60a5fa',borderColor:'#60a5fa',fontSize:'0.85rem'}}>
+                              📹 Open Zoom Recording
+                            </button>
+                          </a>
+                        : <div style={{fontSize:'0.85rem',color:'#52525b'}}>No recording link provided</div>
+                      }
+                    </div>
+                  </>
+                )}
+                <button className="btn" style={{width:'100%',marginTop:'14px'}} onClick={() => setClassPopup(null)}>Close</button>
+              </div>
+            </div>
+          )}
+
+          {/* ══ Student Modal ══ */}
+          {selectedBatch && (
+            <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',backdropFilter:'blur(4px)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000}}
+                 onClick={() => setSelectedBatch(null)}>
+              <div className="card" style={{width:'94%',maxWidth:'1100px',maxHeight:'90vh',overflow:'auto',padding:'28px'}}
+                   onClick={e => e.stopPropagation()}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:'18px'}}>
+                  <div>
+                    <h2 style={{fontSize:'1.3rem',fontWeight:'700',color:'#e4e4e7',marginBottom:'4px'}}>
+                      Batch {selectedBatch.id} — Students
+                    </h2>
+                    <div style={{fontSize:'0.78rem',color:'#71717a'}}>
+                      {selectedBatch.startDate} → {selectedBatch.endDate} &nbsp;·&nbsp; {(studentData[selectedBatch.id]||[]).length} students
+                    </div>
+                  </div>
+                  <button className="btn" onClick={() => setSelectedBatch(null)} style={{fontSize:'1rem',padding:'6px 12px'}}>✕</button>
+                </div>
+                <input placeholder="Search by name or ID..." value={searchTerm} onChange={e=>setSearchTerm(e.target.value)} style={{marginBottom:'18px'}}/>
+                <table className="tbl">
+                  <thead>
+                    <tr>
+                      <th>ID</th><th>Name</th><th>Assignments</th><th>Feedback</th><th>Interviews</th><th>Progress</th><th>Folder</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {filteredStudents.map(s => (
+                      <tr key={s.id}>
+                        <td className="mono" style={{fontWeight:600,color:'#e4e4e7'}}>{s.id}</td>
+                        <td style={{fontWeight:500,color:'#e4e4e7'}}>{s.name}</td>
+                        <td><span style={{color:s.assignments===MAX_ASSIGNMENTS?'#4ade80':'#fbbf24',fontWeight:600}}>{s.assignments}/{MAX_ASSIGNMENTS}</span></td>
+                        <td><span style={{color:s.feedback===MAX_FEEDBACK?'#4ade80':'#fbbf24',fontWeight:600}}>{s.feedback}/{MAX_FEEDBACK}</span></td>
+                        <td><span style={{color:s.interviews===MAX_INTERVIEWS?'#4ade80':'#fbbf24',fontWeight:600}}>{s.interviews}/{MAX_INTERVIEWS}</span></td>
+                        <td>
+                          <div style={{display:'flex',alignItems:'center',gap:'8px'}}>
+                            <div style={{width:'70px'}}><div className="pbar"><div className="pfill" style={{width:`${s.progress}%`}}/></div></div>
+                            <span style={{fontSize:'0.72rem',color:'#71717a'}}>{s.progress}%</span>
+                          </div>
+                        </td>
+                        <td>
+                          {s.folder
+                            ? <a href={s.folder} target="_blank" rel="noopener noreferrer" style={{textDecoration:'none'}}>
+                                <button className="btn" style={{padding:'4px 10px',fontSize:'0.72rem'}}>Open</button>
+                              </a>
+                            : <span style={{color:'#3f3f46'}}>—</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.render(<TrainingDashboard />, document.getElementById('root'));
+  </script>
+</body>
+</html>
